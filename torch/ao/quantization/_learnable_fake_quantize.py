@@ -2,6 +2,11 @@ import torch
 from torch.nn.parameter import Parameter
 from typing import List
 
+from torch.ao.quantization.fake_quantize import _is_per_tensor, _is_per_channel, _is_symmetric_quant
+
+import ipdb
+
+
 __all__: List[str] = []
 
 class _LearnableFakeQuantize(torch.ao.quantization.FakeQuantizeBase):
@@ -64,6 +69,107 @@ class _LearnableFakeQuantize(torch.ao.quantization.FakeQuantizeBase):
         bitrange = torch.tensor(quant_max - quant_min + 1).double()
         self.bitwidth = int(torch.log2(bitrange).item())
         self.register_buffer('eps', torch.tensor([torch.finfo(torch.float32).eps]))
+
+
+    def __setattr__(self, name, value):
+        r"""
+        Called whenever the buffer values have been edited.
+        """
+        ipdb.set_trace()
+        # NOTE: make sure this doesn't get called every time qparams get changed, that would suck.
+
+        # We check if the int8-state buffers have been updated, and if so we update the forward call
+        self._update_forward_call(name, value)
+
+        # Call the original __setattr__ method
+        super(_LearnableFakeQuantize, self).__setattr__(name, value)
+
+
+    def _update_forward_call(self, name, value):
+        r"""
+        If the int-state buffers have been edited, and depending on the new buffer values,
+        we set the forward call of self to be either the float forward or the fake-quant forward,
+        and we either do PTQ or not.
+        """
+        # Check if the attribute being set is a int8-state toggling buffer
+        if name in ['fake_quant_enabled', 'static_enabled']:
+            # Compare the new value with the current value to detect changes
+            ipdb.set_trace()
+            # Check if the value has to change for this code to work,
+            # may just be able to use the buffer value directly
+            # if hasattr(self, name) and getattr(self, name) != value:
+            # Fake quant disabled, we use the fake-quant forward
+            if hasattr(self, name) and getattr(self, name) != value:
+                if value not in [0, 1]:
+                    raise ValueError(f"The value of {name} should be 0 or 1.")
+
+            # If we're in float, we either do PTQ or we don't
+            if not self.fake_quant_enabled:
+                if self.static_enabled:
+                    self.forward = self._get_PTQ_forward() # X
+                else:
+                    self.forward = self._get_float_forward() # X
+
+            # If fake-quant is enabled, it can be either PTQ or QAT
+            else:
+                if self.static_enabled:
+                    self.forward = self._get_PTQ_fake_quant_forward()
+                else:
+                    self.forward = self._get_fake_quant_forward()
+
+
+    def _get_float_forward(self):
+        r"""
+        Sets the forward call to be the float forward, merely returning the input without
+        any quantization operations.
+        """
+        return self.float_forward
+
+    def _get_PTQ_float_forward(self):
+        r"""
+        Sets the forward call to be the PTQ + float operation.
+        """
+        return self._PTQ
+
+
+    def _get_fake_quant_forward(self):
+        r"""
+        Sets the forward call to be the fake-quantize operation, depending
+        on the qscheme. Support qschemes are:
+        - Affine, per-tensor
+        - Affine, per-channel
+        - Symmetric, per-tensor
+        - Symmetric, per-channel
+        """
+        if _is_per_tensor(self.qscheme):
+            if _is_symmetric_quant(self.qscheme):
+                # Symmetric, per-tensor
+                fake_quant_forward = self.fake_quant_forward_per_tensor_symetric
+            else:
+                # Affine, per-tensor
+                fake_quant_forward = self.fake_quant_forward_per_tensor
+        elif _is_per_channel(self.qscheme):
+            if _is_symmetric_quant(self.qscheme):
+                # Symmetric, per-channel
+                fake_quant_forward = self.fake_quant_forward_per_channel_symmetric
+            else:
+                # Affine, per-channel
+                fake_quant_forward = self.fake_quant_forward_per_channel
+        else:
+            raise NotImplementedError(
+                "We currently only have LearnableFakeQuant symmetric/affine per-channel/per-tensor implementations."
+            )
+
+        return fake_quant_forward
+
+
+    def _get_PTQ_fake_quant_forward(self):
+        r"""
+        We call PTQ and fake-quant forward (depending on qscheme), sequentially.
+        """
+        fake_quant_forward = self._get_fake_quant_forward()
+        return fake_quant_forward(self._PTQ) # NOTE: check this works, may need a lambda
+
 
     @torch.jit.export
     def enable_param_learning(self):
@@ -131,6 +237,82 @@ class _LearnableFakeQuantize(torch.ao.quantization.FakeQuantizeBase):
         scale = self.scale.detach()
         zero_point = self.zero_point.detach().round().clamp(self.quant_min, self.quant_max).long()
         return scale, zero_point
+
+    ################
+    ## FORWARD CALLS
+    ################
+    def float_forward(self, X):
+        r"""
+        The floating-point forward call. We do no quantization,
+        and merely return the floating point tensor.
+        """
+        return X
+
+
+    # Fake-Quantization forward calls
+    def fake_quant_forward_per_tensor(self, X):
+        r"""
+        Affine, per-tensor fake-quantization of X.
+        """
+        self.scale.data.clamp_(min=self.eps.item())  # type: ignore[operator]
+
+        grad_factor = self._grad_scaling(X)
+
+        X = torch._fake_quantize_learnable_per_tensor_affine(
+                    X, self.scale, self.zero_point,
+                    self.quant_min, self.quant_max, grad_factor)
+        return X
+
+    def fake_quant_forward_per_channel(self, X):
+        r"""
+        Affine, per-channel fake-quantization of X.
+        """
+        self.scale.data.clamp_(min=self.eps.item())  # type: ignore[operator]
+
+        grad_factor = self._grad_scaling(X)
+
+        X = torch._fake_quantize_learnable_per_channel_affine(
+                    X, self.scale, self.zero_point, self.ch_axis,
+                    self.quant_min, self.quant_max, grad_factor)
+        return X
+
+    def fake_quant_forward_per_tensor_symmetric(self, X):
+        r"""
+        Symmetric, per-tensor fake-quantization forward call.
+        """
+        self.zero_point.data.zero_()
+        X = self.fake_quant_forward_per_channel(self, X)
+        return X
+
+    def fake_quant_forward_per_channel_symmetric(self, X):
+        r"""
+        Symmetric, per-channel fake-quantization forward call.
+        """
+        self.zero_point.data.zero_()
+        X = self.fake_quant_forward_per_channel(self, X)
+        return X
+
+    # PTQ forward call
+    def _PTQ(self, X):
+        r"""
+        Helper function for PTQ. Calls the PTQ observer on X to calculate the qparams,
+        and updates the qparams of `self`.
+        """
+        self.activation_post_process(X.detach())
+        _scale, _zero_point = self.activation_post_process.calculate_qparams()
+        _scale = _scale.to(self.scale.device)
+        _zero_point = _zero_point.to(self.zero_point.device)
+        self.scale.data.copy_(_scale)
+        self.zero_point.data.copy_(_zero_point)
+        return X
+
+    def _grad_scaling(self, X):
+        if self.use_grad_scaling:
+            grad_factor = 1.0 / (X.numel() * self.quant_max) ** 0.5
+        else:
+            grad_factor = 1.0
+
+        return grad_factor
 
     def forward(self, X):
         if self.static_enabled[0] == 1:  # type: ignore[index]
