@@ -70,6 +70,30 @@ class _LearnableFakeQuantize(torch.ao.quantization.FakeQuantizeBase):
         self.bitwidth = int(torch.log2(bitrange).item())
         self.register_buffer('eps', torch.tensor([torch.finfo(torch.float32).eps]))
 
+        self.forward = self.float_forward
+
+    @torch.jit.export
+    def extra_repr(self):
+        """
+        Verbose logging for when one calls this object.
+        """
+        return (
+            "forward_call={}, fake_quant_enabled={}, observer_enabled={}, static_enabled={}, "
+            "learning_enabled={}, scale={}, zero_point={}, "
+            "dtype={}, quant_min={}, quant_max={}, qscheme={}".format(
+                self.forward.__name__,
+                self.fake_quant_enabled.item(),
+                int(self.observer_enabled.item()),
+                self.static_enabled.item(),
+                self.learning_enabled.item(),
+                self.scale,
+                self.zero_point,
+                self.dtype,
+                self.activation_post_process.quant_min,
+                self.activation_post_process.quant_max,
+                self.qscheme,
+            )
+        )
 
     def __setattr__(self, name, value):
         r"""
@@ -135,7 +159,7 @@ class _LearnableFakeQuantize(torch.ao.quantization.FakeQuantizeBase):
     def _get_fake_quant_forward(self):
         r"""
         Sets the forward call to be the fake-quantize operation, depending
-        on the qscheme. Support qschemes are:
+        on the qscheme. Supported qschemes are:
         - Affine, per-tensor
         - Affine, per-channel
         - Symmetric, per-tensor
@@ -307,40 +331,12 @@ class _LearnableFakeQuantize(torch.ao.quantization.FakeQuantizeBase):
         return X
 
     def _grad_scaling(self, X):
+        r"""
+        Grad-scaling calculation.
+        """
         if self.use_grad_scaling:
             grad_factor = 1.0 / (X.numel() * self.quant_max) ** 0.5
         else:
             grad_factor = 1.0
 
         return grad_factor
-
-    def forward(self, X):
-        if self.static_enabled[0] == 1:  # type: ignore[index]
-            self.activation_post_process(X.detach())
-            _scale, _zero_point = self.activation_post_process.calculate_qparams()
-            _scale = _scale.to(self.scale.device)
-            _zero_point = _zero_point.to(self.zero_point.device)
-            self.scale.data.copy_(_scale)
-            self.zero_point.data.copy_(_zero_point)
-        else:
-            self.scale.data.clamp_(min=self.eps.item())  # type: ignore[operator]
-
-        if self.fake_quant_enabled[0] == 1:
-            if self.qscheme in (torch.per_channel_symmetric, torch.per_tensor_symmetric):
-                self.zero_point.data.zero_()
-
-            if self.use_grad_scaling:
-                grad_factor = 1.0 / (X.numel() * self.quant_max) ** 0.5
-            else:
-                grad_factor = 1.0
-            if self.qscheme in (
-                    torch.per_channel_symmetric, torch.per_channel_affine):
-                X = torch._fake_quantize_learnable_per_channel_affine(
-                    X, self.scale, self.zero_point, self.ch_axis,
-                    self.quant_min, self.quant_max, grad_factor)
-            else:
-                X = torch._fake_quantize_learnable_per_tensor_affine(
-                    X, self.scale, self.zero_point,
-                    self.quant_min, self.quant_max, grad_factor)
-
-        return X
