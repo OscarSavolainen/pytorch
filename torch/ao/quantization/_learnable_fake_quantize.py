@@ -81,7 +81,8 @@ class _LearnableFakeQuantize(torch.ao.quantization.FakeQuantizeBase):
             "forward_call={}, fake_quant_enabled={}, observer_enabled={}, static_enabled={}, "
             "learning_enabled={}, scale={}, zero_point={}, "
             "dtype={}, quant_min={}, quant_max={}, qscheme={}".format(
-                self.forward.__name__,
+                self.forward.__name__ if self.forward.__name__ != "<lambda>"
+                else self.forward.__defaults__[0].__name__, ## STRING LAMBDAS HERE WITH A "->" BETWEEN THEM TO SHOW HOW THEY'RE FED
                 self.fake_quant_enabled.item(),
                 int(self.observer_enabled.item()),
                 self.static_enabled.item(),
@@ -265,6 +266,7 @@ class _LearnableFakeQuantize(torch.ao.quantization.FakeQuantizeBase):
     ################
     ## FORWARD CALLS
     ################
+    # NOTE: have these all in shared file with other qconfig forwards.
     def float_forward(self, X):
         r"""
         The floating-point forward call. We do no quantization,
