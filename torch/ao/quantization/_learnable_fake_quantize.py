@@ -66,6 +66,26 @@ class _LearnableFakeQuantize(torch.ao.quantization.FakeQuantizeBase):
         self.register_buffer('eps', torch.tensor([torch.finfo(torch.float32).eps]))
 
     @torch.jit.export
+    def extra_repr(self):
+        """Define a string representation of the object's attributes."""
+        return (
+            "fake_quant_enabled={}, observer_enabled={}, static_enabled={}, "
+            "learning_enabled={}, scale={}, zero_point={}, "
+            "dtype={}, quant_min={}, quant_max={}, qscheme={}".format(
+                self.fake_quant_enabled.item(),
+                int(self.observer_enabled.item()),
+                self.static_enabled.item(),
+                self.learning_enabled.item(),
+                self.scale,
+                self.zero_point,
+                self.dtype,
+                self.activation_post_process.quant_min,
+                self.activation_post_process.quant_max,
+                self.qscheme,
+            )
+        )
+
+    @torch.jit.export
     def enable_param_learning(self):
         r"""Enable parameter learning over static observer estimates.
 
