@@ -190,10 +190,11 @@ class FakeQuantize(FakeQuantizeBase):
         self.is_per_channel = _is_per_channel(self.qscheme)
 
     @torch.jit.export
-    def calculate_qparams(self):
+    def calculate_qparams(self) -> Tuple[torch.Tensor, torch.Tensor]:
         return self.activation_post_process.calculate_qparams()
 
     def forward(self, X):
+        # PTQ / observation of qparams
         if self.observer_enabled[0] == 1:
             self.activation_post_process(X.detach())
             _scale, _zero_point = self.calculate_qparams()
@@ -204,6 +205,7 @@ class FakeQuantize(FakeQuantizeBase):
             self.scale.copy_(_scale)
             self.zero_point.copy_(_zero_point)
 
+        # Fake quantization
         if self.fake_quant_enabled[0] == 1:
             if self.is_per_channel:
                 X = torch.fake_quantize_per_channel_affine(
@@ -216,7 +218,8 @@ class FakeQuantize(FakeQuantizeBase):
         return X
 
     @torch.jit.export
-    def extra_repr(self):
+    def extra_repr(self) -> str:
+        """Define a string representation of the object's attributes."""
         return 'fake_quant_enabled={}, observer_enabled={}, ' \
                'quant_min={}, quant_max={}, dtype={}, qscheme={}, ch_axis={}, ' \
                'scale={}, zero_point={}'.format(
@@ -283,11 +286,11 @@ class FixedQParamsFakeQuantize(FakeQuantize):
             ' FixedQParamsFakeQuantize module, got qscheme:' + str(self.qscheme)
 
     @torch.jit.export
-    def calculate_qparams(self):
+    def calculate_qparams(self) -> Tuple[torch.Tensor, torch.Tensor]:
         return self.scale, self.zero_point
 
     @torch.jit.export
-    def extra_repr(self):
+    def extra_repr(self) -> str:
         """Define a string representation of the object's attributes."""
         return 'fake_quant_enabled={}, observer_enabled={}, scale={}, zero_point={}, ' \
                'dtype={}, quant_min={}, quant_max={}, qscheme={}'.format(
@@ -334,6 +337,7 @@ class FusedMovingAvgObsFakeQuantize(FakeQuantize):
 
     @torch.jit.export
     def extra_repr(self) -> str:
+        """Define a string representation of the object's attributes."""
         return (
             "fake_quant_enabled={}, observer_enabled={}, scale={}, zero_point={}, "
             "dtype={}, quant_min={}, quant_max={}, qscheme={}, reduce_range={}".format(

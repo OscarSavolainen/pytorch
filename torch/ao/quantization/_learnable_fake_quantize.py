@@ -1,6 +1,6 @@
 import torch
 from torch.nn.parameter import Parameter
-from typing import List
+from typing import List, Tuple
 
 __all__: List[str] = []
 
@@ -66,7 +66,7 @@ class _LearnableFakeQuantize(torch.ao.quantization.FakeQuantizeBase):
         self.register_buffer('eps', torch.tensor([torch.finfo(torch.float32).eps]))
 
     @torch.jit.export
-    def extra_repr(self):
+    def extra_repr(self) -> str:
         """Define a string representation of the object's attributes."""
         return (
             "fake_quant_enabled={}, observer_enabled={}, static_enabled={}, "
@@ -146,13 +146,14 @@ class _LearnableFakeQuantize(torch.ao.quantization.FakeQuantizeBase):
         print(f'_LearnableFakeQuantize Zero Point: {self.zero_point.detach()}')
 
     @torch.jit.export
-    def calculate_qparams(self):
+    def calculate_qparams(self) -> Tuple[torch.Tensor, torch.Tensor]:
         self.scale.data.clamp_(min=self.eps.item())  # type: ignore[operator]
         scale = self.scale.detach()
         zero_point = self.zero_point.detach().round().clamp(self.quant_min, self.quant_max).long()
         return scale, zero_point
 
     def forward(self, X):
+        # PTQ / observation of qparams
         if self.static_enabled[0] == 1:  # type: ignore[index]
             self.activation_post_process(X.detach())
             _scale, _zero_point = self.activation_post_process.calculate_qparams()
@@ -163,6 +164,7 @@ class _LearnableFakeQuantize(torch.ao.quantization.FakeQuantizeBase):
         else:
             self.scale.data.clamp_(min=self.eps.item())  # type: ignore[operator]
 
+        # Fake quantization
         if self.fake_quant_enabled[0] == 1:
             if self.qscheme in (torch.per_channel_symmetric, torch.per_tensor_symmetric):
                 self.zero_point.data.zero_()
