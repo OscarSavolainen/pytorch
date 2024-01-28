@@ -1,6 +1,6 @@
 import torch
 from torch.nn.parameter import Parameter
-from typing import Callable, List
+from typing import Callable, List, Tuple
 
 from torch.ao.quantization.fake_quantize import _is_per_tensor, _is_per_channel, _is_symmetric_quant
 
@@ -202,6 +202,26 @@ class _LearnableFakeQuantize(torch.ao.quantization.FakeQuantizeBase):
     ## TOGGLING THE INT8 STATE
     ##########################
     @torch.jit.export
+    def extra_repr(self) -> str:
+        """Define a string representation of the object's attributes."""
+        return (
+            "fake_quant_enabled={}, observer_enabled={}, static_enabled={}, "
+            "learning_enabled={}, scale={}, zero_point={}, "
+            "dtype={}, quant_min={}, quant_max={}, qscheme={}".format(
+                self.fake_quant_enabled.item(),
+                int(self.observer_enabled.item()),
+                self.static_enabled.item(),
+                self.learning_enabled.item(),
+                self.scale,
+                self.zero_point,
+                self.dtype,
+                self.activation_post_process.quant_min,
+                self.activation_post_process.quant_max,
+                self.qscheme,
+            )
+        )
+
+    @torch.jit.export
     def enable_param_learning(self):
         r"""Enable parameter learning over static observer estimates.
 
@@ -262,7 +282,7 @@ class _LearnableFakeQuantize(torch.ao.quantization.FakeQuantizeBase):
         print(f'_LearnableFakeQuantize Zero Point: {self.zero_point.detach()}')
 
     @torch.jit.export
-    def calculate_qparams(self):
+    def calculate_qparams(self) -> Tuple[torch.Tensor, torch.Tensor]:
         self.scale.data.clamp_(min=self.eps.item())  # type: ignore[operator]
         scale = self.scale.detach()
         zero_point = self.zero_point.detach().round().clamp(self.quant_min, self.quant_max).long()
