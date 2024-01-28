@@ -13,7 +13,9 @@ from torch.ao.quantization.observer import (
 )
 import re
 from abc import ABC, abstractmethod
-from typing import Any, Tuple
+from typing import Any, Callable, Tuple
+
+import ipdb
 
 __all__ = [
     "FakeQuantizeBase",
@@ -111,6 +113,77 @@ class FakeQuantizeBase(ABC, Module):
         fake_quant_constructor.__module__ = "torch.ao.quantization.fake_quantize"
         return fake_quant_constructor
 
+    def __setattr__(self, name, value):
+        """
+        Called whenever the attribute values on an instance have been edited. If the int8-state
+        buffers (e.g. fake_quant_enabled, observer_enabled) have been updated, we overrwrite
+        the forward call of the quantization object `self` depending on the updated buffers. We
+        then call the original `__setattr__` method to ensure normal operation.
+        """
+        ipdb.set_trace()
+        # NOTE: make sure this doesn't get called every time qparams get changed, that would suck.
+
+        # We check if the int8-state buffers have been updated, and if so we update the forward call
+        if torch.is_buffer(value):
+            self._update_forward_call(name, value)
+
+        # Call the original __setattr__ method
+        super(self.__class__, self).__setattr__(name, value)
+
+
+    def _update_forward_call(self, name: str, value: torch.Tensor):
+        """
+        If the int-state buffers have been edited, and depending on the new buffer values,
+        we update the forward call of `self`.
+        Options for the forward call are:
+        - float forward: we don't do quantization or PTQ (update of qparams based on observation)
+        - PTQ float forward: we don't do quantization, but we do PTQ
+        - fake quant forward: we do quantization, but no PTQ
+        - fake quant PTQ forward: we do quantization and PTQ
+        """
+        # Check if the attribute being set is a int8-state toggling buffer
+        assert isinstance(name, str)
+        if name in ['fake_quant_enabled', 'observer_enabled', 'static_enabled']:
+            # Compare the new value with the current value to detect changes
+            ipdb.set_trace()
+            # NOTE: NEED TO UPDATE WHEN WE LOAD_STATE_DICT AS WELL!!!!!!
+
+            # NOTE: Check if the value has to change for this code to work,
+            # may just be able to use the buffer value directly
+            # if hasattr(self, name) and getattr(self, name) != value:
+            # Fake quant disabled, we use the fake-quant forward
+            if getattr(self, name) != value:
+                if value not in [0, 1]:
+                    raise ValueError(f"The value of {name} should be 0 or 1.")
+
+            # If the tensor should not be quantized, the forward call should either do PTQ, or not.
+            if not self.fake_quant_enabled:
+                if self.observer_enabled:
+                    self.forward = self._get_observation_float_forward() # X
+                else:
+                    self.forward = self._get_float_forward() # X
+
+            # If fake-quant is enabled, the forward call should either do PTQ, or only do the
+            # fake-quantize operation.
+            else:
+                if self.observer_enabled:
+                    self.forward = self._get_observation_fake_quant_forward()
+                else:
+                    self.forward = self._get_fake_quant_forward()
+
+    def _get_float_forward(self) -> Callable[[torch.Tensor], torch.Tensor]:
+        pass
+
+    def _get_observation_float_forward(self) -> Callable[[torch.Tensor], torch.Tensor]:
+        pass
+
+    def _get_fake_quant_forward(self) -> Callable[[torch.Tensor], torch.Tensor]:
+        pass
+
+    def _get_observation_fake_quant_forward(self) -> Callable[[torch.Tensor], torch.Tensor]:
+        pass
+
+
 class FakeQuantize(FakeQuantizeBase):
     r"""Simulate the quantize and dequantize operations in training time.
 
@@ -190,37 +263,125 @@ class FakeQuantize(FakeQuantizeBase):
         self.is_per_channel = _is_per_channel(self.qscheme)
 
     @torch.jit.export
-    def calculate_qparams(self):
+    def calculate_qparams(self) -> Tuple[torch.Tensor, torch.Tensor]:
         return self.activation_post_process.calculate_qparams()
 
-    def forward(self, X):
-        if self.observer_enabled[0] == 1:
-            self.activation_post_process(X.detach())
-            _scale, _zero_point = self.calculate_qparams()
-            _scale, _zero_point = _scale.to(self.scale.device), _zero_point.to(self.zero_point.device)
-            if self.scale.shape != _scale.shape:
-                self.scale.resize_(_scale.shape)
-                self.zero_point.resize_(_zero_point.shape)
-            self.scale.copy_(_scale)
-            self.zero_point.copy_(_zero_point)
+    ######################
+    # FORWARD CALL GETTERS
+    ######################
+    def _get_float_forward(self) -> Callable[[torch.Tensor], torch.Tensor]:
+        r"""
+        Returns a callable that performs the float forward, merely returning the input without
+        any quantization operations.
+        """
+        return self.float_forward
 
-        if self.fake_quant_enabled[0] == 1:
-            if self.is_per_channel:
-                X = torch.fake_quantize_per_channel_affine(
-                    X, self.scale, self.zero_point,
-                    self.ch_axis, self.activation_post_process.quant_min, self.activation_post_process.quant_max)
-            else:
-                X = torch.fake_quantize_per_tensor_affine(
-                    X, self.scale, self.zero_point,
-                    self.activation_post_process.quant_min, self.activation_post_process.quant_max)
+    def _get_observation_float_forward(self) -> Callable[[torch.Tensor], torch.Tensor]:
+        r"""
+        Returns a callable with the observation + float (no quantization) operation.
+        """
+        return self.observation_forward
+
+    def _get_fake_quant_forward(self) -> Callable[[torch.Tensor], torch.Tensor]:
+        """
+        Returns a callable that performs the fake-quantize operation, depending
+        on `self.qscheme`. Supported qschemes are:
+        - Affine, per-tensor
+        - Affine, per-channel
+        """
+        if _is_per_tensor(self.qscheme):
+            fake_quant_forward = self.fake_quant_forward_per_tensor_affine
+        elif _is_per_channel(self.qscheme):
+            fake_quant_forward = self.fake_quant_forward_per_channel_affine
+        else:
+            raise NotImplementedError(
+                "FakeQuantize currently only supports affine per-channel/per-tensor forward calls."
+            )
+
+        return fake_quant_forward
+
+    def _get_observation_fake_quant_forward(self) -> Callable[[torch.Tensor], torch.Tensor]:
+        r"""
+        Returns a callable that performs PTQ/observation and then the fake-quantize operation, sequentially.
+        """
+        fake_quant_forward = self._get_fake_quant_forward()
+        return fake_quant_forward(self.observation_forward) # NOTE: check this works, may need a lambda
+
+    ###############
+    # FORWARD CALLS
+    ###############
+    def float_forward(self, X: torch.Tensor) -> torch.Tensor:
+        """
+        The floating-point forward call. We do no quantization,
+        and merely return the floating point tensor.
+        """
         return X
 
+    def fake_quant_forward_per_channel_affine(self, X: torch.Tensor) -> torch.Tensor:
+        """
+        Affine, per-channel fake-quantization of X.
+        """
+        X = torch.fake_quantize_per_channel_affine(
+            X, self.scale, self.zero_point,
+            self.ch_axis, self.activation_post_process.quant_min, self.activation_post_process.quant_max
+        )
+        return X
+
+    def fake_quant_forward_per_tensor_affine(self, X: torch.Tensor) -> torch.Tensor:
+        """
+        Affine, per-tensor fake-quantization of X.
+        """
+        X = torch.fake_quantize_per_tensor_affine(
+            X, self.scale, self.zero_point,
+            self.activation_post_process.quant_min, self.activation_post_process.quant_max)
+        return X
+
+    def observation_forward(self, X: torch.Tensor) -> torch.Tensor:
+        """
+        Calls the PTQ observer on X to calculate the qparams,
+        and updates the qparams of `self`.
+        """
+        self.activation_post_process(X.detach())
+        _scale, _zero_point = self.calculate_qparams()
+        _scale, _zero_point = _scale.to(self.scale.device), _zero_point.to(self.zero_point.device)
+        if self.scale.shape != _scale.shape:
+            self.scale.resize_(_scale.shape)
+            self.zero_point.resize_(_zero_point.shape)
+        self.scale.copy_(_scale)
+        self.zero_point.copy_(_zero_point)
+        return X
+
+    # def forward(self, X):
+    #     # PTQ / observation of qparams
+    #     if self.observer_enabled[0] == 1:
+    #         self.activation_post_process(X.detach())
+    #         _scale, _zero_point = self.calculate_qparams()
+    #         _scale, _zero_point = _scale.to(self.scale.device), _zero_point.to(self.zero_point.device)
+    #         if self.scale.shape != _scale.shape:
+    #             self.scale.resize_(_scale.shape)
+    #             self.zero_point.resize_(_zero_point.shape)
+    #         self.scale.copy_(_scale)
+    #         self.zero_point.copy_(_zero_point)
+
+    #     # Fake quantization
+    #     if self.fake_quant_enabled[0] == 1:
+    #         if self.is_per_channel:
+    #             X = torch.fake_quantize_per_channel_affine(
+    #                 X, self.scale, self.zero_point,
+    #                 self.ch_axis, self.activation_post_process.quant_min, self.activation_post_process.quant_max)
+    #         else:
+    #             X = torch.fake_quantize_per_tensor_affine(
+    #                 X, self.scale, self.zero_point,
+    #                 self.activation_post_process.quant_min, self.activation_post_process.quant_max)
+    #     return X
+
     @torch.jit.export
-    def extra_repr(self):
-        return 'fake_quant_enabled={}, observer_enabled={}, ' \
+    def extra_repr(self) -> str:
+        """Define a string representation of the object's attributes."""
+        return 'forward_cal={}, fake_quant_enabled={}, observer_enabled={}, ' \
                'quant_min={}, quant_max={}, dtype={}, qscheme={}, ch_axis={}, ' \
                'scale={}, zero_point={}'.format(
-                   self.fake_quant_enabled, self.observer_enabled,
+                   self.forward.__name__, self.fake_quant_enabled, self.observer_enabled,
                    self.activation_post_process.quant_min, self.activation_post_process.quant_max,
                    self.dtype, self.qscheme, self.ch_axis, self.scale, self.zero_point)
 
@@ -283,17 +444,41 @@ class FixedQParamsFakeQuantize(FakeQuantize):
             ' FixedQParamsFakeQuantize module, got qscheme:' + str(self.qscheme)
 
     @torch.jit.export
-    def calculate_qparams(self):
+    def calculate_qparams(self) -> Tuple[torch.Tensor, torch.Tensor]:
         return self.scale, self.zero_point
 
     @torch.jit.export
-    def extra_repr(self):
+    def extra_repr(self) -> str:
         """Define a string representation of the object's attributes."""
-        return 'fake_quant_enabled={}, observer_enabled={}, scale={}, zero_point={}, ' \
+        return 'forward_call={}, fake_quant_enabled={}, observer_enabled={}, scale={}, zero_point={}, ' \
                'dtype={}, quant_min={}, quant_max={}, qscheme={}'.format(
-                   self.fake_quant_enabled, self.observer_enabled,
+                   self.forward.__name__, self.fake_quant_enabled, self.observer_enabled,
                    self.scale, self.zero_point, self.dtype,
                    self.activation_post_process.quant_min, self.activation_post_process.quant_max, self.qscheme)
+
+    ######################
+    # FORWARD CALL GETTERS
+    ######################
+    def _get_observation_float_forward(self) -> Callable[[torch.Tensor], torch.Tensor]:
+        r"""
+        Returns a callable with thefloat (no quantization) operation.
+        For FixedQParams, there is no observation as the qparams are static.
+        """
+        return self.float_forward
+
+    def _get_fake_quant_forward(self) -> Callable[[torch.Tensor], torch.Tensor]:
+        """
+        Returns a callable that performs the fake-quantize operation. Only per-tensor
+        quantization is supported for FixedQParams.
+        """
+        return self.fake_quant_forward_per_tensor_affine
+
+    def _get_observation_fake_quant_forward(self) -> Callable[[torch.Tensor], torch.Tensor]:
+        r"""
+        Returns the per-tensor fake-quantize operation. Observation is not valid
+        for FixedQparams, and per-channel quantization is not supported.
+        """
+        return self.fake_quant_forward_per_tensor_affine
 
 
 class FusedMovingAvgObsFakeQuantize(FakeQuantize):
@@ -327,6 +512,7 @@ class FusedMovingAvgObsFakeQuantize(FakeQuantize):
         self.register_buffer("fake_quant_enabled", torch.tensor([1], dtype=torch.long))
         self.register_buffer("observer_enabled", torch.tensor([1], dtype=torch.long))
         self.is_symmetric_quant = _is_symmetric_quant(self.activation_post_process.qscheme)
+        self.forward = self.forward
 
     @torch.jit.export
     def calculate_qparams(self) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -334,9 +520,11 @@ class FusedMovingAvgObsFakeQuantize(FakeQuantize):
 
     @torch.jit.export
     def extra_repr(self) -> str:
+        """Define a string representation of the object's attributes."""
         return (
-            "fake_quant_enabled={}, observer_enabled={}, scale={}, zero_point={}, "
+            "forward_call={}, fake_quant_enabled={}, observer_enabled={}, scale={}, zero_point={}, "
             "dtype={}, quant_min={}, quant_max={}, qscheme={}, reduce_range={}".format(
+                self.forward.__name__,
                 self.fake_quant_enabled,
                 self.observer_enabled,
                 self.scale,

@@ -70,13 +70,11 @@ class _LearnableFakeQuantize(torch.ao.quantization.FakeQuantizeBase):
         self.bitwidth = int(torch.log2(bitrange).item())
         self.register_buffer('eps', torch.tensor([torch.finfo(torch.float32).eps]))
 
-        self.forward = self.float_forward
+        self.forward = self._get_observation_fake_quant_forward()
 
     @torch.jit.export
     def extra_repr(self):
-        """
-        Verbose logging for when one calls this object.
-        """
+        """Define a string representation of the object's attributes."""
         return (
             "forward_call={}, fake_quant_enabled={}, observer_enabled={}, static_enabled={}, "
             "learning_enabled={}, scale={}, zero_point={}, "
@@ -97,106 +95,26 @@ class _LearnableFakeQuantize(torch.ao.quantization.FakeQuantizeBase):
         )
 
     def __setattr__(self, name, value):
-        r"""
-        Called whenever the attribute values have been edited. If the int8-state buffers have
-        been updated, we overrwrite the forward call of the quantization object `self` depending
-        on the updated buffers. We then call the original `__setattr__` method to ensure normal
-        operation.
+        """
+        Called whenever the attribute values on an instance have been edited. `static_enabled`
+        is largely redundant to `observer_enabled`, and so if one has been updated we update the other.
+        This allows us to just use `observer_enabled` in a backwards compatible way.
         """
         ipdb.set_trace()
         # NOTE: make sure this doesn't get called every time qparams get changed, that would suck.
 
-        # We check if the int8-state buffers have been updated, and if so we update the forward call
+        # If `static_enabled` has been updated, we update `observer_enabled` to match it,
+        # and vice-versa.
         if torch.is_buffer(value):
-            self._update_forward_call(name, value)
+            if name is 'static_enabled':
+                assert value in [0, 1]
+                self.enable_observer(self, enabled=value)
+            if name is 'observer_enabled':
+                assert value in [0, 1]
+                self.toggle_observer_update(enabled=value)
 
         # Call the original __setattr__ method
-        super(_LearnableFakeQuantize, self).__setattr__(name, value)
-
-
-    def _update_forward_call(self, name, value):
-        r"""
-        If the int-state buffers have been edited, and depending on the new buffer values,
-        we updATE the forward call of `self`.
-        Options for the forward call are:
-        - float forward: we don't do quantization or PTQ (update of qparams based on observation)
-        - PTQ float forward: we don't do quantization, but we do PTQ
-        - fake quant forward: we do quantization, but no PTQ
-        - fake quant PTQ forward: we do quantization and PTQ
-        """
-        # Check if the attribute being set is a int8-state toggling buffer
-        if name in ['fake_quant_enabled', 'static_enabled']:
-            # Compare the new value with the current value to detect changes
-            ipdb.set_trace()
-            # Check if the value has to change for this code to work,
-            # may just be able to use the buffer value directly
-            # if hasattr(self, name) and getattr(self, name) != value:
-            # Fake quant disabled, we use the fake-quant forward
-            if hasattr(self, name) and getattr(self, name) != value:
-                if value not in [0, 1]:
-                    raise ValueError(f"The value of {name} should be 0 or 1.")
-
-            # If the tensor should not be quantized, the forward call should either do PTQ, or not.
-            if not self.fake_quant_enabled:
-                if self.static_enabled:
-                    self.forward = self._get_PTQ_float_forward() # X
-                else:
-                    self.forward = self._get_float_forward() # X
-
-            # If fake-quant is enabled, the forward call should either do PTQ, or only do the
-            # fake-quantize operation.
-            else:
-                if self.static_enabled:
-                    self.forward = self._get_PTQ_fake_quant_forward()
-                else:
-                    self.forward = self._get_fake_quant_forward()
-
-    def _get_float_forward(self) -> Callable[[torch.Tensor], torch.Tensor]:
-        r"""
-        Returns a callable that performs the float forward, merely returning the input without
-        any quantization operations.
-        """
-        return self.float_forward
-
-    def _get_PTQ_float_forward(self) -> Callable[[torch.Tensor], torch.Tensor]:
-        r"""
-        Returns a callable with the PTQ + float (no quantization) forward call.
-        """
-        return self.PTQ
-
-    def _get_fake_quant_forward(self) -> Callable[[torch.Tensor], torch.Tensor]:
-        """
-        Returns a callable that performs the fake-quantize operation, depending
-        on `self.qscheme`. Supported qschemes are:
-        - Affine, per-tensor
-        - Affine, per-channel
-        - Symmetric, per-tensor
-        - Symmetric, per-channel
-        """
-        if _is_per_tensor(self.qscheme):
-            if _is_symmetric_quant(self.qscheme):
-                fake_quant_forward = self.fake_quant_forward_per_tensor_symmetric
-            else:
-                fake_quant_forward = self.fake_quant_forward_per_tensor_affine
-
-        elif _is_per_channel(self.qscheme):
-            if _is_symmetric_quant(self.qscheme):
-                fake_quant_forward = self.fake_quant_forward_per_channel_symmetric
-            else:
-                fake_quant_forward = self.fake_quant_forward_per_channel_affine
-        else:
-            raise NotImplementedError(
-                "_LearnableFakeQuantize currently only supports symmetric/affine and per-channel/per-tensor forward calls."
-            )
-
-        return fake_quant_forward
-
-    def _get_PTQ_fake_quant_forward(self) -> Callable[[torch.Tensor], torch.Tensor]:
-        r"""
-        Returns a callable that performs PTQ and then the fake-quantize operation, sequentially.
-        """
-        fake_quant_forward = self._get_fake_quant_forward()
-        return fake_quant_forward(self.PTQ) # NOTE: check this works, may need a lambda
+        super(self.__class__, self).__setattr__(name, value)
 
     ##########################
     ## TOGGLING THE INT8 STATE
@@ -288,6 +206,56 @@ class _LearnableFakeQuantize(torch.ao.quantization.FakeQuantizeBase):
         zero_point = self.zero_point.detach().round().clamp(self.quant_min, self.quant_max).long()
         return scale, zero_point
 
+    ######################
+    # FORWARD CALL GETTERS
+    ######################
+    def _get_float_forward(self) -> Callable[[torch.Tensor], torch.Tensor]:
+        r"""
+        Returns a callable that performs the float forward, merely returning the input without
+        any quantization operations.
+        """
+        return self.float_forward
+
+    def _get_observation_float_forward(self) -> Callable[[torch.Tensor], torch.Tensor]:
+        r"""
+        Returns a callable with the observation (PTQ) + float (no quantization) forward call.
+        """
+        return self.observation_forward
+
+    def _get_fake_quant_forward(self) -> Callable[[torch.Tensor], torch.Tensor]:
+        """
+        Returns a callable that performs the fake-quantize operation, depending
+        on `self.qscheme`. Supported qschemes are:
+        - Affine, per-tensor
+        - Affine, per-channel
+        - Symmetric, per-tensor
+        - Symmetric, per-channel
+        """
+        if _is_per_tensor(self.qscheme):
+            if _is_symmetric_quant(self.qscheme):
+                fake_quant_forward = self.fake_quant_forward_per_tensor_symmetric
+            else:
+                fake_quant_forward = self.fake_quant_forward_per_tensor_affine
+
+        elif _is_per_channel(self.qscheme):
+            if _is_symmetric_quant(self.qscheme):
+                fake_quant_forward = self.fake_quant_forward_per_channel_symmetric
+            else:
+                fake_quant_forward = self.fake_quant_forward_per_channel_affine
+        else:
+            raise NotImplementedError(
+                "_LearnableFakeQuantize currently only supports symmetric/affine and per-channel/per-tensor forward calls."
+            )
+
+        return fake_quant_forward
+
+    def _get_observation_fake_quant_forward(self) -> Callable[[torch.Tensor], torch.Tensor]:
+        r"""
+        Returns a callable that performs PTQ and then the fake-quantize operation, sequentially.
+        """
+        fake_quant_forward = self._get_fake_quant_forward()
+        return fake_quant_forward(self.observation_forward) # NOTE: check this works, may need a lambda
+
     ################
     ## FORWARD CALLS
     ################
@@ -316,7 +284,7 @@ class _LearnableFakeQuantize(torch.ao.quantization.FakeQuantizeBase):
         return X
 
     def fake_quant_forward_per_channel_affine(self, X: torch.Tensor) -> torch.Tensor:
-        r"""
+        """
         Affine, per-channel fake-quantization of X.
         """
         # Keeps the scale from learning too-small values.
@@ -349,7 +317,7 @@ class _LearnableFakeQuantize(torch.ao.quantization.FakeQuantizeBase):
         return X
 
     # PTQ forward call
-    def PTQ(self, X: torch.Tensor) -> torch.Tensor:
+    def observation_forward(self, X: torch.Tensor) -> torch.Tensor:
         """
         Calls the PTQ observer on X to calculate the qparams,
         and updates the qparams of `self`.
