@@ -1,4 +1,5 @@
 # Owner(s): ["module: inductor"]
+import gc
 import math
 import sys
 import unittest
@@ -13,7 +14,10 @@ from torch._dynamo.testing import rand_strided
 from torch._dynamo.utils import same
 from torch._inductor import config
 from torch._inductor.compile_fx import compile_fx_inner
+from torch._inductor.runtime.hints import DeviceProperties
+from torch._inductor.utils import run_and_get_code
 from torch.fx.experimental.proxy_tensor import make_fx
+from torch.testing import FileCheck
 from torch.testing._internal.common_cuda import PLATFORM_SUPPORTS_FLASH_ATTENTION
 from torch.testing._internal.common_utils import (
     DeterministicGuard,
@@ -378,12 +382,8 @@ class CudaReproTests(TestCase):
         https://github.com/pytorch/torchdynamo/issues/1670
         """
         from torch._C import _cuda_getCurrentRawStream as get_cuda_stream
-        from torch._inductor.triton_heuristics import (
-            CachingAutotuner,
-            grid,
-            HeuristicType,
-        )
-        from torch._inductor.utils import instance_descriptor
+        from torch._inductor.runtime.hints import HeuristicType, instance_descriptor
+        from torch._inductor.runtime.triton_heuristics import CachingAutotuner, grid
 
         def autotune(configs, meta):
             def decorator(fn):
@@ -406,7 +406,7 @@ class CudaReproTests(TestCase):
             ],
             meta={
                 "signature": {0: "*fp32", 1: "*fp32", 2: "i32"},
-                "device": 0,
+                "device": DeviceProperties.create(torch.device("cuda")),
                 "configs": [instance_descriptor(divisible_by_16=(0, 1), equal_to_1=())],
                 "constants": {},
             },
@@ -966,24 +966,29 @@ class CudaReproTests(TestCase):
         self.assertEqual(ref, res)
 
     @config.patch({"triton.cudagraphs": True})
+    @config.patch({"fx_graph_cache": True})
     def test_index_put_cudagraph(self):
-        def fn(x, y, z):
-            x = torch.zeros_like(x)
-            return x.index_put([y], z, True)
+        for _ in range(2):
 
-        x = torch.zeros((512, 512), device="cuda", dtype=torch.bool)
-        y = torch.zeros((512,), device="cuda", dtype=torch.int64)
-        z = torch.ones((512, 512), device="cuda", dtype=torch.bool)
+            def fn(x, y, z):
+                x = torch.zeros_like(x)
+                return x.index_put([y], z, True)
 
-        opt_fn = torch._dynamo.optimize("inductor")(fn)
+            x = torch.zeros((512, 512), device="cuda", dtype=torch.bool)
+            y = torch.zeros((512,), device="cuda", dtype=torch.int64)
+            z = torch.ones((512, 512), device="cuda", dtype=torch.bool)
 
-        ref = fn(x, y, z)
+            opt_fn = torch._dynamo.optimize("inductor")(fn)
 
-        # run it twice to test cuda graph issue
-        res = opt_fn(x, y, z)
-        res = opt_fn(x, y, z)
+            ref = fn(x, y, z)
 
-        self.assertEqual(ref, res)
+            # run it twice to test cuda graph issue
+            res = opt_fn(x, y, z)
+            res = opt_fn(x, y, z)
+
+            self.assertEqual(ref, res)
+            torch._dynamo.reset()
+            gc.collect()
 
     @unittest.skipIf(
         not PLATFORM_SUPPORTS_FLASH_ATTENTION, "flash attention not supported"
@@ -1072,6 +1077,22 @@ class CudaReproTests(TestCase):
 
         self.assertEqual(o1, o2)
 
+    def test_cat_int8_one_kernel(self):
+        @torch.compile()
+        def cat(inps):
+            return torch.cat(inps) + 1
+
+        for dtype in [torch.uint8, torch.int8]:
+            inps = [
+                torch.empty([256, 256], dtype=dtype, device="cuda") for _ in range(4)
+            ]
+
+            out, code = run_and_get_code(cat, inps)
+            self.assertEqual(torch.cat(inps) + 1, out)
+            FileCheck().check_not("aten.cat.default(").check_count(
+                ".run(", 1, exactly=True
+            ).run(code[0])
+
     @config.patch("triton.use_block_ptr", True)
     def test_selecsls42b_misaligned_address(self):
         # https://github.com/openai/triton/issues/2836
@@ -1116,7 +1137,7 @@ class CudaReproTests(TestCase):
 
 
 if __name__ == "__main__":
-    from torch._dynamo.test_case import run_tests
+    from torch._inductor.test_case import run_tests
     from torch.testing._internal.inductor_utils import HAS_CUDA
 
     if HAS_CUDA and not TEST_WITH_ASAN:

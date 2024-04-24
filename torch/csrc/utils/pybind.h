@@ -15,9 +15,6 @@
 #include <torch/csrc/Stream.h>
 #include <torch/csrc/utils/tensor_memoryformats.h>
 
-#include <stdexcept>
-#include <utility>
-
 namespace py = pybind11;
 
 // This makes intrusive_ptr to be available as a custom pybind11 holder type,
@@ -196,6 +193,12 @@ struct type_caster<c10::Stream> {
  public:
   // NOLINTNEXTLINE(cppcoreguidelines-non-private-member-variables-in-classes)
   PYBIND11_TYPE_CASTER(c10::Stream, _("torch.Stream"));
+
+  // PYBIND11_TYPE_CASTER defines a member field called value. Since c10::Stream
+  // cannot be default-initialized, we provide this constructor to explicitly
+  // initialize that field. The value doesn't matter as it will be overwritten
+  // after a successful call to load.
+  type_caster() : value(c10::Stream::DEFAULT, c10::Device(c10::kCPU, 0)) {}
 
   bool load(handle src, bool) {
     PyObject* obj = src.ptr();

@@ -355,12 +355,13 @@ inline PythonArgs PythonArgParser::parse(
     PyObject* args,
     PyObject* kwargs,
     ParsedArgs<N>& dst) {
-  if (N < max_args) {
-    throw ValueError(
-        "PythonArgParser: dst ParsedArgs buffer does not have enough capacity, expected %d (got %d)",
-        (int)max_args,
-        N);
-  }
+  TORCH_CHECK_VALUE(
+      N >= max_args,
+      "PythonArgParser: dst ParsedArgs buffer does not have enough capacity, expected ",
+      max_args,
+      " (got ",
+      N,
+      ")");
   return raw_parse(self, args, kwargs, dst.args);
 }
 
@@ -701,7 +702,7 @@ inline std::vector<double> PythonArgs::getDoublelist(int i) {
         tuple ? PyTuple_GET_ITEM(arg, idx) : PyList_GET_ITEM(arg, idx);
     try {
       res[idx] = THPUtils_unpackDouble(obj);
-    } catch (const std::exception& e) {
+    } catch (const std::exception&) {
       throw TypeError(
           "%s(): argument '%s' must be %s, but found element of type %s at pos %zu",
           signature.name.c_str(),
@@ -807,6 +808,11 @@ inline at::Device toDevice(PyObject* obj) {
   if (THPUtils_checkLong(obj)) {
     const auto device_index = THPUtils_unpackLong(obj);
     TORCH_CHECK(device_index >= 0, "Device index must not be negative");
+    if (c10::is_privateuse1_backend_registered()) {
+      return at::Device(
+          c10::DeviceType::PrivateUse1,
+          static_cast<c10::DeviceIndex>(device_index));
+    }
     return at::Device(
         c10::DeviceType::CUDA, static_cast<c10::DeviceIndex>(device_index));
   }

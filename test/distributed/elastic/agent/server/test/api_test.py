@@ -12,21 +12,22 @@ import signal
 import unittest
 import uuid
 from typing import Any, Dict
-from unittest.mock import call, patch, MagicMock
+from unittest.mock import call, MagicMock, patch
 
 import torch.distributed.elastic.rendezvous.registry as rdzv_registry
 from torch.distributed.elastic.agent.server.api import (
+    _get_fq_hostname,
+    _RoleInstanceInfo,
     RunResult,
     SimpleElasticAgent,
     WorkerGroup,
     WorkerSpec,
     WorkerState,
-    _get_fq_hostname,
-    _RoleInstanceInfo,
 )
 from torch.distributed.elastic.multiprocessing import SignalException
 from torch.distributed.elastic.multiprocessing.errors import ProcessFailure
 from torch.distributed.elastic.rendezvous import RendezvousHandler, RendezvousParameters
+from torch.distributed.elastic.rendezvous.api import RendezvousGracefulExitError
 from torch.distributed.elastic.utils.distributed import get_free_port
 from torch.testing._internal.common_utils import run_tests
 
@@ -53,7 +54,7 @@ class WorkerGroupTest(unittest.TestCase):
             args=(),
             rdzv_handler=None,
             max_restarts=50,
-            monitor_interval=1,
+            monitor_interval=0.1,
         )
         worker_group = WorkerGroup(spec)
 
@@ -156,7 +157,7 @@ class SimpleElasticAgentTest(unittest.TestCase):
     def _get_worker_spec(
         self,
         max_restarts=1,
-        monitor_interval=1.0,
+        monitor_interval=0.1,
         role="test_trainer",
         local_world_size=8,
         local_addr=None,
@@ -581,6 +582,15 @@ class SimpleElasticAgentTest(unittest.TestCase):
                 agent.run()
             args, _ = shutdown_mock.call_args
             self.assertEqual(signal.SIGTERM, args[0])
+
+    @patch("torch.distributed.elastic.agent.server.api.put_metric")
+    @patch.object(TestAgent, "_invoke_run")
+    def test_agent_process_handler_graceful_exception(self, invoke_run, _):
+        spec = self._get_worker_spec(max_restarts=0)
+        agent = TestAgent(spec)
+        invoke_run.side_effect = RendezvousGracefulExitError()
+        with patch.object(agent, "_shutdown"):
+            agent.run()
 
 
 if __name__ == "__main__":

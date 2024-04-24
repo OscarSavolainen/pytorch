@@ -6,14 +6,16 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 import datetime
+import functools
 import socket
 from contextlib import closing
+from typing import Optional
 
 import torch.distributed as dist
 from torch.distributed.elastic.utils.logging import get_logger
 
 
-log = get_logger(__name__)
+logger = get_logger(__name__)
 
 _ADDRESS_IN_USE = "Address already in use"
 _SOCKET_TIMEOUT = "Socket Timeout"
@@ -30,6 +32,7 @@ def create_c10d_store(
     timeout: float = (60 * 10),  # 10 min
     wait_for_workers: bool = True,
     retries=3,
+    use_libuv: Optional[bool] = None,
 ):
     if server_port == -1 and world_size > 1:
         raise ValueError(
@@ -37,7 +40,7 @@ def create_c10d_store(
         )
 
     if server_port != -1:
-        log.info("sever_port: %s, specified, ignoring retries", server_port)
+        logger.info("sever_port: %s, specified, ignoring retries", server_port)
 
     # only retry when server_port is NOT static
     attempt = retries if server_port == -1 else 1
@@ -47,7 +50,7 @@ def create_c10d_store(
         else:
             port = get_free_port()
 
-        log.info(
+        logger.info(
             "Creating c10d store on %s:%s\n"
             "  world_size  : %s\n"
             "  is_server   : %s\n"
@@ -56,7 +59,8 @@ def create_c10d_store(
         )
 
         try:
-            store = dist.TCPStore(
+            store_builder = functools.partial(
+                dist.TCPStore,
                 host_name=server_addr,
                 port=port,
                 world_size=world_size,
@@ -64,10 +68,15 @@ def create_c10d_store(
                 timeout=datetime.timedelta(seconds=timeout),
                 wait_for_workers=wait_for_workers,
             )
+            if use_libuv is None:
+                # TCPStore default backend may change, don't specify it unless we explicity told to do so.
+                store = store_builder()
+            else:
+                store = store_builder(use_libuv=use_libuv)
             # skips full rank check when we don't have to wait for all workers
             if wait_for_workers:
                 _check_full_rank(store, world_size)
-            log.info("Successfully created c10d store")
+            logger.info("Successfully created c10d store")
             return store
         except RuntimeError as e:
             # this is brittle, but the underlying exception type is not properly pybinded
@@ -77,7 +86,7 @@ def create_c10d_store(
             # TODO properly map the exceptions in pybind (c10d/init.cpp)
             if str(e) == _ADDRESS_IN_USE:  # this will only happen on the server
                 if attempt < retries:
-                    log.warning(
+                    logger.warning(
                         "port: %s already in use, attempt: [%s/%s]", port, attempt, retries
                     )
                     attempt += 1
@@ -140,5 +149,5 @@ def get_socket_with_port() -> socket.socket:
             return s
         except OSError as e:
             s.close()
-            log.info("Socket creation attempt failed.", exc_info=e)
+            logger.warning("Socket creation attempt failed.", exc_info=e)
     raise RuntimeError("Failed to create a socket")
